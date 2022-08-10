@@ -528,17 +528,16 @@ int main(int argc, const char* argv[]) {
 
   // Creating P2P buffer
   size_t chunk_size = sizeof(ap_uint<64>) * 40 * 1024 * 1024;
+  
   cl_mem_ext_ptr_t p2pBOExt = {0};
   p2pBOExt.flags = XCL_MEM_EXT_P2P_BUFFER;
   cl::Buffer p2pBO(context, CL_MEM_READ_ONLY | CL_MEM_EXT_PTR_XILINX, chunk_size, &p2pBOExt, NULL);
-
   // Map P2P Buffer into the host space
   void* p2pPtr = q.enqueueMapBuffer(p2pBO, CL_TRUE, CL_MAP_WRITE | CL_MAP_READ, 0, chunk_size, nullptr, nullptr, &err);
   q.finish();
   if (err) {
     std::cout << err << "p2p buffer is not into the host address\n";
   }
-
 
   // load image data
   for (const auto & file : std::filesystem::directory_iterator(input_dir)) {
@@ -575,17 +574,17 @@ int main(int argc, const char* argv[]) {
 #endif
 
     // Create device buffer and map dev buf to host buf
-    std::vector<cl::Buffer> buffer(3);
+    std::vector<cl::Buffer> buffer(2);
 
-    buffer[1] = cl::Buffer(context, CL_MEM_EXT_PTR_XILINX | CL_MEM_USE_HOST_PTR | CL_MEM_WRITE_ONLY,
+    buffer[0] = cl::Buffer(context, CL_MEM_EXT_PTR_XILINX | CL_MEM_USE_HOST_PTR | CL_MEM_WRITE_ONLY,
         sizeof(ap_uint<64>) * MAXCMP_BC * 8, &mext_in[1]);
-    buffer[2] = cl::Buffer(context, CL_MEM_EXT_PTR_XILINX | CL_MEM_USE_HOST_PTR | CL_MEM_WRITE_ONLY,
+    buffer[1] = cl::Buffer(context, CL_MEM_EXT_PTR_XILINX | CL_MEM_USE_HOST_PTR | CL_MEM_WRITE_ONLY,
         sizeof(ap_uint<32>) * 1024, &mext_in[2]);
 
 
     // migrate data from host to device
+    q.enqueueMigrateMemObjects({buffer[0]}, CL_MIGRATE_MEM_OBJECT_CONTENT_UNDEFINED, nullptr, nullptr);
     q.enqueueMigrateMemObjects({buffer[1]}, CL_MIGRATE_MEM_OBJECT_CONTENT_UNDEFINED, nullptr, nullptr);
-    q.enqueueMigrateMemObjects({buffer[2]}, CL_MIGRATE_MEM_OBJECT_CONTENT_UNDEFINED, nullptr, nullptr);
     q.finish();
     std::cout << "migrate data from host to device \n";
 
@@ -593,22 +592,22 @@ int main(int argc, const char* argv[]) {
     std::cout << "Data transfer from host buffer to device buffer\n";
     
     //q.enqueueCopyBuffer(p2pBO, buffer[0], 0, 0, sizeof(uint8_t) * (size));
-    q.finish();
+    //q.finish();
     std::cout << "Copy p2pBo to buffer for kernel\n";
     
 
     kernel_jpegDecoder.setArg(0, p2pBO);
     kernel_jpegDecoder.setArg(1, (int)size);
-    kernel_jpegDecoder.setArg(2, buffer[1]);
-    kernel_jpegDecoder.setArg(3, buffer[2]);
+    kernel_jpegDecoder.setArg(2, buffer[0]);
+    kernel_jpegDecoder.setArg(3, buffer[1]);
 
     // Setup kernel
     std::cout << "INFO: Finish kernel setup" << std::endl;
     q.enqueueTask(kernel_jpegDecoder);
     q.finish();
 
+    q.enqueueMigrateMemObjects({buffer[0]}, 1); // 1 : migrate from dev to host
     q.enqueueMigrateMemObjects({buffer[1]}, 1); // 1 : migrate from dev to host
-    q.enqueueMigrateMemObjects({buffer[2]}, 1); // 1 : migrate from dev to host
     q.finish();
 
     std::cout << "INFO: Finish kernel execution" << std::endl;
