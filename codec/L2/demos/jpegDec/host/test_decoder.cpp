@@ -15,6 +15,7 @@
  */
 
 //#define _HLS_TEST_ 1
+#define _GPU_SOURCE
 
 #ifndef _HLS_TEST_
 #include "xcl2.hpp"
@@ -26,6 +27,8 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+#include <fcntl.h>
+#include <unistd.h>
 #include <filesystem>
 #endif
 
@@ -62,15 +65,17 @@ template <typename T>
 int load_dat(T*& data, const std::string& name, int& size) {
   uint64_t n;
   std::string fn = name;
-  FILE* f = fopen(fn.c_str(), "rb");
+  //int fd = open(fn.c_str(), O_RDWR | O_DIRECT);
+  FILE* fd = fopen(fn.c_str(), "rb");
   std::cout << "WARNING: " << fn << " will be opened for binary read." << std::endl;
-  if (!f) {
+  if (!fd) {
     std::cerr << "ERROR: " << fn << " cannot be opened for binary read." << std::endl;
     return -1;
   }
 
-  fseek(f, 0, SEEK_END);
-  n = (uint64_t)ftell(f);
+  //n = (uint64_t)lseek(fd, 0, SEEK_END);
+  fseek(fd, 0, SEEK_END);
+  n = (uint64_t)ftell(fd);
   if (n > MAX_DEC_PIX) {
     std::cout << " read n bytes > MAX_DEC_PIX, please set a larger MAX_DEC_PIX " << std::endl;
     return 1;
@@ -80,10 +85,42 @@ int load_dat(T*& data, const std::string& name, int& size) {
 #else
   data = (T*)malloc(MAX_DEC_PIX);
 #endif
-  fseek(f, 0, SEEK_SET);
-  size = fread(data, sizeof(char), n, f);
-  fclose(f);
+  fseek(fd, 0, SEEK_SET);
+  size = fread(data, sizeof(char), n ,fd);
+  //size = pread(fd, data, n, 0);;
+  fclose(fd);
   std::cout << n << " entries read from " << fn << std::endl;
+
+  return 0;
+}
+
+
+template <typename T>
+int load_dat2(T*& data, const std::string& name, int& size) {
+  uint64_t n;
+  std::string fn = name;
+  int fd = open(fn.c_str(), O_RDWR);
+  std::cout << "WARNING: " << fn << " will be opened for binary read." << std::endl;
+  if (!fd) {
+    std::cerr << "ERROR: " << fn << " cannot be opened for binary read." << std::endl;
+    return -1;
+  }
+
+  n = (uint64_t)lseek(fd, 0, SEEK_END);
+  if (n > MAX_DEC_PIX) {
+    std::cout << " read n bytes > MAX_DEC_PIX, please set a larger MAX_DEC_PIX " << std::endl;
+    return 1;
+  }
+#if __linux
+  //data = aligned_alloc<T>(n);
+  //std::cout << "__linux \n";
+#else
+  data = (T*)malloc(MAX_DEC_PIX);
+#endif
+  size = pread(fd, data, n, 0);
+  close(fd);
+  std::cout << "pread return: " << size << " " << fn << std::endl;
+  //std::cout << n << " entries read from " << fn << std::endl;
 
   return 0;
 }
@@ -383,6 +420,8 @@ int main(int argc, const char* argv[]) {
   std::string xclbin_path;
   std::string input_dir;
 
+  int err;
+
   // cmd arg parser.
   ArgParser parser(argc, argv);
 
@@ -409,7 +448,6 @@ int main(int argc, const char* argv[]) {
   // size of jpeg_pointer, output of yuv_mcu_pointer, and output image infos
 
   int size;
-  uint8_t* jpeg_pointer;
 #ifndef _HLS_TEST_
   ap_uint<64>* yuv_mcu_pointer = aligned_alloc<ap_uint<64> >(sizeof(ap_uint<64>) * MAXCMP_BC * 8);
   ap_uint<32>* infos = aligned_alloc<ap_uint<32> >(sizeof(ap_uint<32>) * 1024);
@@ -437,7 +475,7 @@ int main(int argc, const char* argv[]) {
   // 1: huffman data is not in expectation
   int rtn2 = false;
 
-#ifdef _HLS_TEST_
+#ifdef _HLS_TEST_/
   uint32_t hls_mcuc;
   uint16_t hls_mcuh;
   uint16_t hls_mcuv;
@@ -488,23 +526,34 @@ int main(int argc, const char* argv[]) {
   logger.logCreateKernel(fail);
   std::cout << "INFO: Kernel has been created" << std::endl;
 
+  // Creating P2P buffer
+  size_t chunk_size = sizeof(ap_uint<64>) * 40 * 1024 * 1024;
+  cl_mem_ext_ptr_t p2pBOExt = {0};
+  p2pBOExt.flags = XCL_MEM_EXT_P2P_BUFFER;
+  cl::Buffer p2pBO(context, CL_MEM_READ_ONLY | CL_MEM_EXT_PTR_XILINX, chunk_size, &p2pBOExt, NULL);
+
+  // Map P2P Buffer into the host space
+  void* p2pPtr = q.enqueueMapBuffer(p2pBO, CL_TRUE, CL_MAP_WRITE | CL_MAP_READ, 0, chunk_size, nullptr, nullptr, &err);
+  q.finish();
+  if (err) {
+    std::cout << err << "p2p buffer is not into the host address\n";
+  }
+
 
   // load image data
-
   for (const auto & file : std::filesystem::directory_iterator(input_dir)) {
 
-    int err = load_dat(jpeg_pointer, file.path(), size);
+    err = load_dat2(p2pPtr, file.path(), size);
     if (err) {
       printf("Alloc buf failed!, size:%d Bytes\n", size);
       return err;
     }
     std::cout << "file: " << file.path() << '\n';
-
 #ifndef USE_HBM
     // DDR Settings
     std::vector<cl_mem_ext_ptr_t> mext_in(3);
     mext_in[0].flags = XCL_MEM_DDR_BANK0;
-    mext_in[0].obj = jpeg_pointer;
+    mext_in[0].obj = nullptr;
     mext_in[0].param = 0;
     mext_in[1].flags = XCL_MEM_DDR_BANK0; //error?
     mext_in[1].obj = yuv_mcu_pointer;
@@ -528,97 +577,42 @@ int main(int argc, const char* argv[]) {
     // Create device buffer and map dev buf to host buf
     std::vector<cl::Buffer> buffer(3);
 
-    buffer[0] = cl::Buffer(context, CL_MEM_EXT_PTR_XILINX | CL_MEM_USE_HOST_PTR | CL_MEM_READ_WRITE,
-        sizeof(uint8_t) * (size), &mext_in[0]);
     buffer[1] = cl::Buffer(context, CL_MEM_EXT_PTR_XILINX | CL_MEM_USE_HOST_PTR | CL_MEM_WRITE_ONLY,
         sizeof(ap_uint<64>) * MAXCMP_BC * 8, &mext_in[1]);
     buffer[2] = cl::Buffer(context, CL_MEM_EXT_PTR_XILINX | CL_MEM_USE_HOST_PTR | CL_MEM_WRITE_ONLY,
         sizeof(ap_uint<32>) * 1024, &mext_in[2]);
 
-    // add buffers to migrate
-    std::vector<cl::Memory> init;
-    for (int i = 0; i < 3; i++) {
-      init.push_back(buffer[i]);
-    }
 
     // migrate data from host to device
-    q.enqueueMigrateMemObjects(init, CL_MIGRATE_MEM_OBJECT_CONTENT_UNDEFINED, nullptr, nullptr);
+    q.enqueueMigrateMemObjects({buffer[1]}, CL_MIGRATE_MEM_OBJECT_CONTENT_UNDEFINED, nullptr, nullptr);
+    q.enqueueMigrateMemObjects({buffer[2]}, CL_MIGRATE_MEM_OBJECT_CONTENT_UNDEFINED, nullptr, nullptr);
     q.finish();
+    std::cout << "migrate data from host to device \n";
 
-    // Data transfer from host buffer to device buffer
-    std::vector<cl::Memory> ob_in;
-    std::vector<cl::Memory> ob_out;
-    ob_in.push_back(buffer[0]);
-    ob_out.push_back(buffer[1]);
-    ob_out.push_back(buffer[2]);
 
-    kernel_jpegDecoder.setArg(0, buffer[0]);
-    kernel_jpegDecoder.setArg(1, size);
+    std::cout << "Data transfer from host buffer to device buffer\n";
+    
+    //q.enqueueCopyBuffer(p2pBO, buffer[0], 0, 0, sizeof(uint8_t) * (size));
+    q.finish();
+    std::cout << "Copy p2pBo to buffer for kernel\n";
+    
+
+    kernel_jpegDecoder.setArg(0, p2pBO);
+    kernel_jpegDecoder.setArg(1, (int)size);
     kernel_jpegDecoder.setArg(2, buffer[1]);
     kernel_jpegDecoder.setArg(3, buffer[2]);
-    //    kernel_jpegDecoder.setArg(4, rtn);
-    //    kernel_jpegDecoder.setArg(5, rtn2);
 
     // Setup kernel
     std::cout << "INFO: Finish kernel setup" << std::endl;
-    const int num_runs = 1;
-    std::vector<std::vector<cl::Event> > events_write(num_runs);
-    std::vector<std::vector<cl::Event> > events_kernel(num_runs);
-    std::vector<std::vector<cl::Event> > events_read(num_runs);
-
-    for (int i = 0; i < num_runs; ++i) {
-      events_kernel[i].resize(1);
-      events_write[i].resize(1);
-      events_read[i].resize(1);
-    }
-
-    for (int i = 0; i < num_runs; ++i) {
-      if (i < 1) {
-        q.enqueueMigrateMemObjects(ob_in, 0, nullptr, &events_write[i][0]); // 0 : migrate from host to dev
-      } else {
-        q.enqueueMigrateMemObjects(ob_in, 0, &events_read[i - 1],
-            &events_write[i][0]); // 0 : migrate from host to dev
-      }
-      // Launch kernel and compute kernel execution time
-      q.enqueueTask(kernel_jpegDecoder, &events_write[i], &events_kernel[i][0]);
-
-      // Data transfer from device buffer to host buffer
-      q.enqueueMigrateMemObjects(ob_out, 1, &events_kernel[i], &events_read[i][0]); // 1 : migrate from dev to host
-    }
+    q.enqueueTask(kernel_jpegDecoder);
     q.finish();
 
-    gettimeofday(&endE2E, 0);
+    q.enqueueMigrateMemObjects({buffer[1]}, 1); // 1 : migrate from dev to host
+    q.enqueueMigrateMemObjects({buffer[2]}, 1); // 1 : migrate from dev to host
+    q.finish();
+
     std::cout << "INFO: Finish kernel execution" << std::endl;
     std::cout << "INFO: Finish E2E execution" << std::endl;
-
-    // print related times
-    unsigned long timeStart, timeEnd, exec_time0, write_time, read_time;
-    std::cout << "-------------------------------------------------------" << std::endl;
-    events_write[0][0].getProfilingInfo(CL_PROFILING_COMMAND_START, &timeStart);
-    events_write[0][0].getProfilingInfo(CL_PROFILING_COMMAND_END, &timeEnd);
-    write_time = (timeEnd - timeStart) / 1000.0;
-    std::cout << "INFO: Data transfer from host to device: " << write_time << " us\n";
-    std::cout << "-------------------------------------------------------" << std::endl;
-    events_read[0][0].getProfilingInfo(CL_PROFILING_COMMAND_START, &timeStart);
-    events_read[0][0].getProfilingInfo(CL_PROFILING_COMMAND_END, &timeEnd);
-    read_time = (timeEnd - timeStart) / 1000.0;
-    std::cout << "INFO: Data transfer from device to host: " << read_time << " us\n";
-    std::cout << "-------------------------------------------------------" << std::endl;
-
-    exec_time0 = 0;
-    for (int i = 0; i < num_runs; ++i) {
-      events_kernel[i][0].getProfilingInfo(CL_PROFILING_COMMAND_START, &timeStart);
-      events_kernel[i][0].getProfilingInfo(CL_PROFILING_COMMAND_END, &timeEnd);
-      exec_time0 += (timeEnd - timeStart) / 1000.0;
-      unsigned long t = (timeEnd - timeStart) / 1000.0;
-      printf("INFO: kernel %d: execution time %lu usec\n", i, t);
-    }
-    exec_time0 = exec_time0 / (unsigned long)num_runs;
-    std::cout << "INFO: Average kernel execution per run: " << exec_time0 << " us\n";
-    std::cout << "-------------------------------------------------------" << std::endl;
-    unsigned long exec_timeE2E = diff(&endE2E, &startE2E);
-    std::cout << "INFO: Average E2E per run: " << exec_timeE2E << " us\n";
-    std::cout << "-------------------------------------------------------" << std::endl;
 
     rebuild_infos(img_info, cmp_info, bas_info, rtn, rtn2, infos);
 #endif
@@ -650,10 +644,9 @@ int main(int argc, const char* argv[]) {
     }
 
     printf("INFO: writing the YUV file!\n");
-    rebuild_raw_yuv(JPEGFile, &bas_info, hls_bc, yuv_mcu_pointer);
+    rebuild_raw_yuv(file.path(), &bas_info, hls_bc, yuv_mcu_pointer);
   }
 
-  free(jpeg_pointer);
   free(hls_block);
   free(infos);
   free(yuv_row_pointer);
