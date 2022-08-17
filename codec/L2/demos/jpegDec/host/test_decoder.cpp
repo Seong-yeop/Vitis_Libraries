@@ -336,7 +336,6 @@ void rebuild_yuv2bgr(std::string file_name,
     ap_uint<64>* yuv_mcu_pointer) {
   
   xf::codec::idct_out_t* yuv_mcu_pointer_pix = (uint8_t*)malloc(sizeof(uint8_t) * bas_info->all_blocks * 64);
-  //printf("all blocks: %d\n", bas_info->all_blocks); 
 
   int cnt = 0;
   int cnt_row = 0;
@@ -350,17 +349,6 @@ void rebuild_yuv2bgr(std::string file_name,
     }
   }
   
-  FILE *f;
-  std::string file = file_name.substr(file_name.find_last_of('/') + 1);
-  std::string fn = file.substr(0, file.find_last_of(".")) + ".raw";
-  
-  fn = file.substr(0, file.find(".")) + ".yuv";
-  f = fopen(fn.c_str(), "wb");
-  std::cout << "WARNING: " << fn << " will be opened for binary write." << std::endl;
-  if (!f) {
-    std::cerr << "ERROR: " << fn << " cannot be opened for binary write." << std::endl;
-  }
-
   xf::codec::COLOR_FORMAT fmt = bas_info->format;
 
   int dpos[MAX_NUM_COLOR]; // the dc position of the pointer
@@ -374,6 +362,8 @@ void rebuild_yuv2bgr(std::string file_name,
   printf("INFO: fmt %d, bas_info->mcu_cmp = %d \n", fmt, (int)(bas_info->mcu_cmp));
   printf("INFO: bas_info->hls_mbs[cmp] %d, %d, %d \n", bas_info->hls_mbs[0], bas_info->hls_mbs[1],
       bas_info->hls_mbs[2]);
+
+  enum cv::ColorConversionCodes color_code;
 
 LOOP_write_yuv_buffer:
   while (n_mcu < (int)(bas_info->hls_mcuc)) {
@@ -389,7 +379,7 @@ LOOP_write_yuv_buffer:
         } // end block
 
         if (fmt == xf::codec::C420) { // 420 mbs= 0 1 2 3 0 0
-
+          color_code = cv::COLOR_YUV2BGR_I420;
           if (mbs == 0) {
             if (cmp != 0 && (dpos[cmp] % bas_info->axi_width[1] == bas_info->axi_width[1] - 1)) {
               dpos[cmp] += 1 + bas_info->axi_width[1] * (8 - 1);
@@ -408,6 +398,7 @@ LOOP_write_yuv_buffer:
             }
           }
         } else if (fmt == xf::codec::C422) { // 422 mbs 0 1 0 0
+          color_code = cv::COLOR_YUV2BGR_Y422;
           if (mbs == 0) {
             if (cmp != 0 && (dpos[cmp] % bas_info->axi_width[1] == bas_info->axi_width[1] - 1)) {
               dpos[cmp] += 1 + bas_info->axi_width[1] * (8 - 1);
@@ -422,6 +413,7 @@ LOOP_write_yuv_buffer:
             }
           }
         } else {
+          color_code = cv::COLOR_YUV2BGR;
           if (dpos[cmp] % block_width == block_width - 1) {
             dpos[cmp] += 1 + block_width * (8 - 1);
           } else {
@@ -464,28 +456,8 @@ LOOP_write_yuv_buffer:
       yuv_row_pointer + bas_info->axi_height[0] * bas_info->axi_width[0] * 128 * sizeof(char), 
       bas_info->axi_height[2] * bas_info->axi_width[2] * 64 * sizeof(char)); 
 
-  cv::cvtColor(yuv_img, rgb_img, cv::COLOR_YUV2BGR_I420);
-  cv::imwrite("test1.jpg", yuv_img);
-  cv::imwrite("test.tiff", rgb_img);
-  cv::imwrite("test.png", rgb_img);
-  cv::imwrite("test.jpg", rgb_img);
-
+  cv::cvtColor(yuv_img, rgb_img, color_code);
   
-LOOP_write_y:
-  fwrite(yuv_row_pointer, sizeof(char), bas_info->axi_height[0] * bas_info->axi_width[0] * 64, f);
-  printf("write(y) counts: %d\n", bas_info->axi_height[0] * bas_info->axi_width[0] * 64, f);
-LOOP_write_u:
-  fwrite(yuv_row_pointer + bas_info->axi_height[0] * bas_info->axi_width[0] * 64, sizeof(char),
-      bas_info->axi_height[1] * bas_info->axi_width[1] * 64, f);
-  printf("write(u) counts: %d\n", bas_info->axi_height[1] * bas_info->axi_width[1] * 64, f);
-LOOP_write_v:
-  fwrite(yuv_row_pointer + bas_info->axi_height[0] * bas_info->axi_width[0] * 128, sizeof(char),
-      bas_info->axi_height[2] * bas_info->axi_width[2] * 64, f);
-  printf("write(v) counts: %d\n", bas_info->axi_height[2] * bas_info->axi_width[2] * 64, f);
-
-  // fwrite(&end_file, 1, 1, f);//write 0x0a
-  fclose(f);
-
   printf("Please open the YUV file with fmt %d and (width, height) = (%d, %d) \n", fmt, bas_info->axi_width[0] * 8,
       bas_info->axi_height[0] * 8);
 
