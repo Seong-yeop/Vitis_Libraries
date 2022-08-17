@@ -15,7 +15,6 @@
  */
 
 //#define _HLS_TEST_ 1
-#define _GPU_SOURCE
 
 #ifndef _HLS_TEST_
 #include "xcl2.hpp"
@@ -30,6 +29,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <filesystem>
+#include <chrono>
+#include <opencv2/opencv.hpp>
 #endif
 
 #ifdef _HLS_TEST_
@@ -327,6 +328,169 @@ LOOP_write_v:
   fclose(f);
 }
 
+
+void rebuild_yuv2bgr(std::string file_name,
+    xf::codec::bas_info* bas_info,
+    int hls_bc[MAX_NUM_COLOR],
+    // hls::stream<xf::codec::idct_out_t >   strm_iDCT_x8[8],
+    ap_uint<64>* yuv_mcu_pointer) {
+  
+  xf::codec::idct_out_t* yuv_mcu_pointer_pix = (uint8_t*)malloc(sizeof(uint8_t) * bas_info->all_blocks * 64);
+  //printf("all blocks: %d\n", bas_info->all_blocks); 
+
+  int cnt = 0;
+  int cnt_row = 0;
+  for (int b = 0; b < (int)(bas_info->all_blocks); b++) {
+    for (int i = 0; i < 8; i++) { // write one block of Y or U or V
+      for (int j = 0; j < 8; j++) {
+        yuv_mcu_pointer_pix[cnt] = yuv_mcu_pointer[cnt_row](8 * (j + 1) - 1, 8 * j); // strm_iDCT_x8[j].read();
+        cnt++;
+      }
+      cnt_row++;
+    }
+  }
+  
+  FILE *f;
+  std::string file = file_name.substr(file_name.find_last_of('/') + 1);
+  std::string fn = file.substr(0, file.find_last_of(".")) + ".raw";
+  
+  fn = file.substr(0, file.find(".")) + ".yuv";
+  f = fopen(fn.c_str(), "wb");
+  std::cout << "WARNING: " << fn << " will be opened for binary write." << std::endl;
+  if (!f) {
+    std::cerr << "ERROR: " << fn << " cannot be opened for binary write." << std::endl;
+  }
+
+  xf::codec::COLOR_FORMAT fmt = bas_info->format;
+
+  int dpos[MAX_NUM_COLOR]; // the dc position of the pointer
+  for (int cmp = 0; cmp < MAX_NUM_COLOR; cmp++) {
+    dpos[cmp] = 0;
+  }
+
+  uint16_t block_width = bas_info->axi_width[0];
+  int n_mcu = 0;
+
+  printf("INFO: fmt %d, bas_info->mcu_cmp = %d \n", fmt, (int)(bas_info->mcu_cmp));
+  printf("INFO: bas_info->hls_mbs[cmp] %d, %d, %d \n", bas_info->hls_mbs[0], bas_info->hls_mbs[1],
+      bas_info->hls_mbs[2]);
+
+LOOP_write_yuv_buffer:
+  while (n_mcu < (int)(bas_info->hls_mcuc)) {
+    for (int cmp = 0; cmp < MAX_NUM_COLOR; cmp++) {              // 0,1,2
+      for (int mbs = 0; mbs < bas_info->hls_mbs[cmp]; mbs++) { // 0,1,2,3, 0, 0,
+
+        for (int i = 0; i < 8; i++) { // write one block of Y or U or V
+          for (int j = 0; j < 8; j++) {
+            yuv_row_pointer[(cmp)*bas_info->axi_height[0] * bas_info->axi_width[0] * 64 + (dpos[cmp]) * 8 +
+              j * bas_info->axi_width[cmp] * 8 + i] = *yuv_mcu_pointer_pix;
+            yuv_mcu_pointer_pix++;
+          }
+        } // end block
+
+        if (fmt == xf::codec::C420) { // 420 mbs= 0 1 2 3 0 0
+
+          if (mbs == 0) {
+            if (cmp != 0 && (dpos[cmp] % bas_info->axi_width[1] == bas_info->axi_width[1] - 1)) {
+              dpos[cmp] += 1 + bas_info->axi_width[1] * (8 - 1);
+            } else {
+              dpos[cmp] += 1;
+            }
+          } else if (mbs == 1) {
+            dpos[cmp] += block_width * 8 - 1;
+          } else if (mbs == 2) {
+            dpos[cmp] += 1;
+          } else {
+            if (dpos[cmp] % (block_width * (8) * 2) == (8 + 1) * block_width - 1) {
+              dpos[cmp] += 1 + block_width * (8 - 1);
+            } else {
+              dpos[cmp] -= block_width * 8 - 1;
+            }
+          }
+        } else if (fmt == xf::codec::C422) { // 422 mbs 0 1 0 0
+          if (mbs == 0) {
+            if (cmp != 0 && (dpos[cmp] % bas_info->axi_width[1] == bas_info->axi_width[1] - 1)) {
+              dpos[cmp] += 1 + bas_info->axi_width[1] * (8 - 1);
+            } else {
+              dpos[cmp] += 1;
+            }
+          } else { // cmp=0, mbs=1
+            if (dpos[cmp] % (block_width) == block_width - 1) {
+              dpos[cmp] += 1 + block_width * (8 - 1);
+            } else {
+              dpos[cmp] += 1;
+            }
+          }
+        } else {
+          if (dpos[cmp] % block_width == block_width - 1) {
+            dpos[cmp] += 1 + block_width * (8 - 1);
+          } else {
+            dpos[cmp] += 1;
+          }
+        }
+      }
+    } // end one mcu
+
+
+    n_mcu++;
+  }
+
+  for (int i = 0; i < 16; i++) {
+    for (int j = 0; j < 8; j++) {
+      printf("%02X, ", (uint8_t)(yuv_row_pointer[8 * i + j]));
+    }
+    printf("\n");
+  }
+
+  for (int i = 0; i < 16; i++) {
+    for (int j = 0; j < 8; j++) {
+      printf("%d, ", (uint8_t)(yuv_row_pointer[8 * i + j]));
+    }
+    printf("\n");
+  }
+
+  cv::Mat yuv_img;
+  cv::Mat rgb_img;
+  yuv_img.create(bas_info->axi_height[0] * 8 * 3/2, bas_info->axi_width[0] * 8, CV_8UC1);
+
+  memcpy(yuv_img.data, yuv_row_pointer, bas_info->axi_height[0] * bas_info->axi_width[0] * 64 * sizeof(char)); 
+  
+  memcpy(yuv_img.data + bas_info->axi_height[0] * bas_info->axi_width[0] * 64 * sizeof(char),
+      yuv_row_pointer + bas_info->axi_height[0] * bas_info->axi_width[0] * 64 * sizeof(char),
+      bas_info->axi_height[1] * bas_info->axi_width[1] * 64 * sizeof(char)); 
+  
+  memcpy(yuv_img.data + bas_info->axi_height[0] * bas_info->axi_width[0] * 64 * sizeof(char)
+      + bas_info->axi_height[1] * bas_info->axi_width[1] * 64 * sizeof(char),
+      yuv_row_pointer + bas_info->axi_height[0] * bas_info->axi_width[0] * 128 * sizeof(char), 
+      bas_info->axi_height[2] * bas_info->axi_width[2] * 64 * sizeof(char)); 
+
+  cv::cvtColor(yuv_img, rgb_img, cv::COLOR_YUV2BGR_I420);
+  cv::imwrite("test1.jpg", yuv_img);
+  cv::imwrite("test.tiff", rgb_img);
+  cv::imwrite("test.png", rgb_img);
+  cv::imwrite("test.jpg", rgb_img);
+
+  
+LOOP_write_y:
+  fwrite(yuv_row_pointer, sizeof(char), bas_info->axi_height[0] * bas_info->axi_width[0] * 64, f);
+  printf("write(y) counts: %d\n", bas_info->axi_height[0] * bas_info->axi_width[0] * 64, f);
+LOOP_write_u:
+  fwrite(yuv_row_pointer + bas_info->axi_height[0] * bas_info->axi_width[0] * 64, sizeof(char),
+      bas_info->axi_height[1] * bas_info->axi_width[1] * 64, f);
+  printf("write(u) counts: %d\n", bas_info->axi_height[1] * bas_info->axi_width[1] * 64, f);
+LOOP_write_v:
+  fwrite(yuv_row_pointer + bas_info->axi_height[0] * bas_info->axi_width[0] * 128, sizeof(char),
+      bas_info->axi_height[2] * bas_info->axi_width[2] * 64, f);
+  printf("write(v) counts: %d\n", bas_info->axi_height[2] * bas_info->axi_width[2] * 64, f);
+
+  // fwrite(&end_file, 1, 1, f);//write 0x0a
+  fclose(f);
+
+  printf("Please open the YUV file with fmt %d and (width, height) = (%d, %d) \n", fmt, bas_info->axi_width[0] * 8,
+      bas_info->axi_height[0] * 8);
+
+}
+
 // ------------------------------------------------------------
 void rebuild_infos(xf::codec::img_info& img_info,
     xf::codec::cmp_info cmp_info[MAX_NUM_COLOR],
@@ -456,10 +620,6 @@ int main(int argc, const char* argv[]) {
   ap_uint<32>* infos = (ap_uint<32>*)malloc(sizeof(ap_uint<32>) * 1024);
 #endif
 
-  // Variables to measure time
-  struct timeval startE2E, endE2E;
-  gettimeofday(&startE2E, 0);
-
   // To test SYNTHESIS top
   hls::stream<ap_uint<24> > block_strm;
   xf::codec::cmp_info cmp_info[MAX_NUM_COLOR];
@@ -539,6 +699,10 @@ int main(int argc, const char* argv[]) {
     std::cout << err << "p2p buffer is not into the host address\n";
   }
 
+
+  // start
+  std::chrono::high_resolution_clock::time_point start = std::chrono::high_resolution_clock::now();
+
   // load image data
   for (const auto & file : std::filesystem::directory_iterator(input_dir)) {
 
@@ -575,7 +739,6 @@ int main(int argc, const char* argv[]) {
 
     // Create device buffer and map dev buf to host buf
     std::vector<cl::Buffer> buffer(2);
-
     buffer[0] = cl::Buffer(context, CL_MEM_EXT_PTR_XILINX | CL_MEM_USE_HOST_PTR | CL_MEM_WRITE_ONLY,
         sizeof(ap_uint<64>) * MAXCMP_BC * 8, &mext_in[1]);
     buffer[1] = cl::Buffer(context, CL_MEM_EXT_PTR_XILINX | CL_MEM_USE_HOST_PTR | CL_MEM_WRITE_ONLY,
@@ -589,11 +752,10 @@ int main(int argc, const char* argv[]) {
     std::cout << "migrate data from host to device \n";
 
 
-    std::cout << "Data transfer from host buffer to device buffer\n";
-    
+    //std::cout << "Data transfer from host buffer to device buffer\n";
     //q.enqueueCopyBuffer(p2pBO, buffer[0], 0, 0, sizeof(uint8_t) * (size));
     //q.finish();
-    std::cout << "Copy p2pBo to buffer for kernel\n";
+    //std::cout << "Copy p2pBo to buffer for kernel\n";
     
 
     kernel_jpegDecoder.setArg(0, p2pBO);
@@ -601,13 +763,27 @@ int main(int argc, const char* argv[]) {
     kernel_jpegDecoder.setArg(2, buffer[0]);
     kernel_jpegDecoder.setArg(3, buffer[1]);
 
+    // error ? 
+    q.enqueueMigrateMemObjects({buffer[0]}, 0);
+    q.enqueueMigrateMemObjects({buffer[1]}, 0);
+    q.finish();
+
     // Setup kernel
     std::cout << "INFO: Finish kernel setup" << std::endl;
     q.enqueueTask(kernel_jpegDecoder);
     q.finish();
+    std::cout << "INFO: Finish kernel Task" << std::endl;
 
-    q.enqueueMigrateMemObjects({buffer[0]}, 1); // 1 : migrate from dev to host
-    q.enqueueMigrateMemObjects({buffer[1]}, 1); // 1 : migrate from dev to host
+    err = q.enqueueMigrateMemObjects({buffer[0]}, 1); // 1 : migrate from dev to host
+    if (err) {
+      std::cout << "[ERROR] migrate from dev to host ... \n";
+      return err;
+    }
+    err = q.enqueueMigrateMemObjects({buffer[1]}, 1); // 1 : migrate from dev to host
+    if (err) {
+      std::cout << "[ERROR] migrate from dev to host ... \n";
+      return err;
+    }
     q.finish();
 
     std::cout << "INFO: Finish kernel execution" << std::endl;
@@ -643,14 +819,24 @@ int main(int argc, const char* argv[]) {
     }
 
     printf("INFO: writing the YUV file!\n");
-    rebuild_raw_yuv(file.path(), &bas_info, hls_bc, yuv_mcu_pointer);
+    //rebuild_raw_yuv(file.path(), &bas_info, hls_bc, yuv_mcu_pointer);
+    rebuild_yuv2bgr(file.path(), &bas_info, hls_bc, yuv_mcu_pointer);
   }
+
 
   free(hls_block);
   free(infos);
   free(yuv_row_pointer);
 
-  std::cout << "Ready for next image!\n ";
+  std::cout << "Test is done!\n ";
+  // end
+  std::chrono::high_resolution_clock::time_point end = std::chrono::high_resolution_clock::now();
+  cl_ulong elasped_time = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+  
+  double dnsduration = (double)elasped_time;
+  double dsduration = dnsduration / ((double)1000000);
+
+  std::cout << "elasped_time: " << dsduration << "\n";
 
   return 0;
 }
