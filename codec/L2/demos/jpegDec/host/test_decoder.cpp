@@ -329,12 +329,14 @@ LOOP_write_v:
 }
 
 
-void rebuild_yuv2bgr(std::string file_name,
+int yuv2bgr(std::string file_name,
     xf::codec::bas_info* bas_info,
     int hls_bc[MAX_NUM_COLOR],
-    // hls::stream<xf::codec::idct_out_t >   strm_iDCT_x8[8],
-    ap_uint<64>* yuv_mcu_pointer) {
-  
+    ap_uint<64>* yuv_mcu_pointer,
+    cv::Mat& bgr_img) {
+
+  std::string file = file_name.substr(file_name.find_last_of('/') + 1);
+  std::string fn = file.substr(0, file.find_last_of(".")) + ".bgr";
   xf::codec::idct_out_t* yuv_mcu_pointer_pix = (uint8_t*)malloc(sizeof(uint8_t) * bas_info->all_blocks * 64);
 
   int cnt = 0;
@@ -442,7 +444,6 @@ LOOP_write_yuv_buffer:
   }
 
   cv::Mat yuv_img;
-  cv::Mat rgb_img;
   yuv_img.create(bas_info->axi_height[0] * 8 * 3/2, bas_info->axi_width[0] * 8, CV_8UC1);
 
   memcpy(yuv_img.data, yuv_row_pointer, bas_info->axi_height[0] * bas_info->axi_width[0] * 64 * sizeof(char)); 
@@ -456,11 +457,12 @@ LOOP_write_yuv_buffer:
       yuv_row_pointer + bas_info->axi_height[0] * bas_info->axi_width[0] * 128 * sizeof(char), 
       bas_info->axi_height[2] * bas_info->axi_width[2] * 64 * sizeof(char)); 
 
-  cv::cvtColor(yuv_img, rgb_img, color_code);
-  
+  cv::cvtColor(yuv_img, bgr_img, color_code);
+
   printf("Please open the YUV file with fmt %d and (width, height) = (%d, %d) \n", fmt, bas_info->axi_width[0] * 8,
       bas_info->axi_height[0] * 8);
 
+  return 0;
 }
 
 // ------------------------------------------------------------
@@ -674,11 +676,18 @@ int main(int argc, const char* argv[]) {
 
   // start
   std::chrono::high_resolution_clock::time_point start = std::chrono::high_resolution_clock::now();
+    
+  std::chrono::nanoseconds read_data_total_time;
+  std::chrono::nanoseconds write_data_total_time;
 
   // load image data
   for (const auto & file : std::filesystem::directory_iterator(input_dir)) {
 
+    std::chrono::high_resolution_clock::time_point load_data_start = std::chrono::high_resolution_clock::now();
     err = load_dat2(p2pPtr, file.path(), size);
+    std::chrono::high_resolution_clock::time_point load_data_end = std::chrono::high_resolution_clock::now();
+    read_data_total_time += load_data_end = load_data_start;
+
     if (err) {
       printf("Alloc buf failed!, size:%d Bytes\n", size);
       return err;
@@ -792,7 +801,8 @@ int main(int argc, const char* argv[]) {
 
     printf("INFO: writing the YUV file!\n");
     //rebuild_raw_yuv(file.path(), &bas_info, hls_bc, yuv_mcu_pointer);
-    rebuild_yuv2bgr(file.path(), &bas_info, hls_bc, yuv_mcu_pointer);
+    cv::Mat bgr_img;
+    yuv2bgr(file.path(), &bas_info, hls_bc, yuv_mcu_pointer, bgr_img);
   }
 
 
